@@ -2,48 +2,76 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { MapController } from './components/MapController';
 import { Sidebar } from './components/Sidebar';
 import { analyzeLocation, generateTravelPhoto, blobToBase64 } from './services/geminiService';
-import { Coordinates, LocationContext, AppStatus, TimeEra } from './types';
+import { Coordinates, LocationContext, AppStatus, TimeEra, VisualStyle, PointOfInterest } from './types';
+import { Key, MapPin } from 'lucide-react';
 
 const App: React.FC = () => {
+  const [apiKey, setApiKey] = useState<string>('');
   const [apiKeyReady, setApiKeyReady] = useState(false);
+  
   const [selectedLocation, setSelectedLocation] = useState<Coordinates | null>(null);
   const [locationInfo, setLocationInfo] = useState<LocationContext | null>(null);
   const [status, setStatus] = useState<AppStatus>('idle');
-  const [generatedImageUrl, setGeneratedImageUrl] = useState<string | null>(null);
+  
+  // Store array of images now
+  const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Initialize API Key
+  // Initialize: Check for stored key or environment key
   useEffect(() => {
     const initApiKey = async () => {
-      try {
-        const win = window as any;
-        if (win.aistudio) {
-          const hasKey = await win.aistudio.hasSelectedApiKey();
-          if (!hasKey) {
-            await win.aistudio.openSelectKey();
-          }
+      // 1. Check AI Studio (Dev env)
+      const win = window as any;
+      if (win.aistudio) {
+        try {
+            const hasKey = await win.aistudio.hasSelectedApiKey();
+            if (hasKey) {
+                // If AI Studio handles the key, we assume it's injected or managed
+                // But specifically for this request, if env var exists we use it, otherwise prompts.
+                if (process.env.API_KEY) {
+                    setApiKey(process.env.API_KEY);
+                    setApiKeyReady(true);
+                    return;
+                }
+            }
+        } catch(e) { console.error(e); }
+      }
+
+      // 2. Check process.env (Build env)
+      if (process.env.API_KEY) {
+        setApiKey(process.env.API_KEY);
+        setApiKeyReady(true);
+        return;
+      }
+
+      // 3. Check Local Storage (User persistence for web)
+      const storedKey = localStorage.getItem('gemini_api_key');
+      if (storedKey) {
+          setApiKey(storedKey);
           setApiKeyReady(true);
-        } else {
-          // Fallback if not running in the specific environment
-           if (process.env.API_KEY) setApiKeyReady(true);
-        }
-      } catch (e) {
-        console.error("API Key selection failed", e);
       }
     };
     initApiKey();
   }, []);
 
-  const openKeySelection = async () => {
-    const win = window as any;
-    if (win.aistudio) {
-      try {
-        await win.aistudio.openSelectKey();
-        setApiKeyReady(true);
-      } catch (e) {
-        console.error("Failed to open key selection", e);
+  const handleManualKeySubmit = (e: React.FormEvent, keyInput: string) => {
+      e.preventDefault();
+      if (keyInput.trim().length > 0) {
+          setApiKey(keyInput.trim());
+          localStorage.setItem('gemini_api_key', keyInput.trim());
+          setApiKeyReady(true);
       }
-    }
+  };
+
+  const clearApiKey = () => {
+      setApiKey('');
+      setApiKeyReady(false);
+      localStorage.removeItem('gemini_api_key');
+      // If in AI Studio, try to open selector
+      const win = window as any;
+      if (win.aistudio) {
+           win.aistudio.openSelectKey();
+      }
   };
 
   const handleError = async (error: any, defaultMsg: string) => {
@@ -53,26 +81,18 @@ const App: React.FC = () => {
     const msg = error.message || JSON.stringify(error);
     
     if (msg.includes("429") || msg.includes("Quota") || msg.includes("RESOURCE_EXHAUSTED")) {
-        // Try to extract retry time from message "Please retry in X s."
         const retryMatch = msg.match(/retry in ([0-9.]+)s/);
         const retryTime = retryMatch ? retryMatch[1] : null;
-        
         let displayMsg = "Quota/Rate limit exceeded.";
         if (retryTime) {
             displayMsg += ` Please wait ${Math.ceil(parseFloat(retryTime))} seconds before trying again.`;
         } else {
             displayMsg += " Please try again later or check your billing.";
         }
-        
         setErrorMessage(displayMsg);
-        // Do NOT force openKeySelection automatically for rate limits as it might be temporary.
-        // The sidebar will show a button to change key if needed.
-    } else if (msg.includes("400") || msg.includes("expired") || msg.includes("API_KEY_INVALID")) {
-        setErrorMessage("Your API Key has expired or is invalid. Please select a new API Key.");
-        await openKeySelection();
-    } else if (msg.includes("Requested entity was not found")) {
-        setErrorMessage("API Key not found or invalid. Please select a new API Key.");
-        await openKeySelection();
+    } else if (msg.includes("400") || msg.includes("expired") || msg.includes("API_KEY_INVALID") || msg.includes("not found")) {
+        setErrorMessage("Invalid API Key. Please update your key.");
+        clearApiKey();
     } else {
         setErrorMessage(defaultMsg + ": " + (error.message || "Unknown error"));
     }
@@ -82,41 +102,58 @@ const App: React.FC = () => {
     if (!apiKeyReady) return;
 
     setSelectedLocation(coords);
-    setGeneratedImageUrl(null);
+    setGeneratedImages([]); // Clear previous images
     setStatus('analyzing_location');
     setLocationInfo(null);
     setErrorMessage(null);
 
     try {
-      const info = await analyzeLocation(coords.lat, coords.lng);
+      const info = await analyzeLocation(coords.lat, coords.lng, apiKey);
       setLocationInfo(info);
       setStatus('ready_to_generate');
     } catch (error) {
       await handleError(error, "Failed to analyze location");
     }
-  }, [apiKeyReady]);
+  }, [apiKeyReady, apiKey]);
 
-  const handleGenerate = async (file: File, era: TimeEra, year?: string, customPrompt?: string) => {
+  const handlePoiSelect = useCallback((poi: PointOfInterest) => {
+      handleLocationSelect({ lat: poi.lat, lng: poi.lng });
+  }, [handleLocationSelect]);
+
+  const handleGenerate = async (file: File, era: TimeEra, year?: string, customPrompt?: string, style: VisualStyle = 'Realistic') => {
     if (!selectedLocation || !locationInfo) return;
 
     setStatus('generating_image');
     setErrorMessage(null);
+    setGeneratedImages([]);
     
     try {
       const base64Image = await blobToBase64(file);
       
-      const imageUrl = await generateTravelPhoto(
-        selectedLocation.lat,
-        selectedLocation.lng,
-        locationInfo.name,
-        era,
-        base64Image,
-        locationInfo.weather.condition,
-        year,
-        customPrompt
-      );
+      // Generate 2 distinct images
+      const variations = [
+          "Wide Angle Shot (Establishing Context)",
+          "Medium Shot (Character Interaction)"
+      ];
 
-      setGeneratedImageUrl(imageUrl);
+      for (const variation of variations) {
+          const imageUrl = await generateTravelPhoto(
+            apiKey,
+            selectedLocation.lat,
+            selectedLocation.lng,
+            locationInfo.name,
+            era,
+            base64Image,
+            locationInfo.weather.condition,
+            year,
+            customPrompt,
+            style,
+            variation
+          );
+          // Add to array
+          setGeneratedImages(prev => [...prev, imageUrl]);
+      }
+
       setStatus('complete');
 
     } catch (error) {
@@ -127,26 +164,54 @@ const App: React.FC = () => {
   const handleReset = () => {
     setSelectedLocation(null);
     setLocationInfo(null);
-    setGeneratedImageUrl(null);
+    setGeneratedImages([]);
     setStatus('idle');
     setErrorMessage(null);
   };
 
+  // --- WELCOME / API KEY SCREEN ---
   if (!apiKeyReady) {
     return (
-      <div className="h-screen w-full flex items-center justify-center bg-slate-50">
-        <div className="text-center space-y-4 p-8">
-            <h1 className="text-2xl font-bold text-slate-800">ChronoTravel AI</h1>
-            <p className="text-slate-600">Please select an API Key to continue.</p>
-            <button 
-                onClick={openKeySelection}
-                className="px-6 py-2 bg-indigo-600 text-white rounded-full hover:bg-indigo-700"
-            >
-                Select Key
-            </button>
-            <div className="text-xs text-slate-400 mt-4">
-                <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noreferrer" className="underline hover:text-indigo-500">
-                    Billing Documentation
+      <div className="h-screen w-full flex flex-col items-center justify-center bg-slate-100 p-4 font-sans">
+        <div className="bg-white p-8 rounded-2xl shadow-xl max-w-md w-full text-center space-y-6">
+            <div className="flex justify-center mb-4">
+                 <div className="w-16 h-16 bg-indigo-100 rounded-full flex items-center justify-center text-indigo-600">
+                    <MapPin className="w-8 h-8" />
+                 </div>
+            </div>
+            <div>
+                <h1 className="text-3xl font-bold text-slate-800 mb-2">ChronoTravel AI</h1>
+                <p className="text-slate-500 text-sm leading-relaxed">
+                    Time travel to 10,000 B.C. or the distant future. 
+                    <br/>Enter your Gemini API Key to begin.
+                </p>
+            </div>
+            
+            <form onSubmit={(e) => {
+                const input = (document.getElementById('apiKeyInput') as HTMLInputElement).value;
+                handleManualKeySubmit(e, input);
+            }} className="space-y-4">
+                <div className="relative">
+                    <Key className="absolute left-3 top-3 w-5 h-5 text-slate-400" />
+                    <input 
+                        id="apiKeyInput"
+                        type="password" 
+                        placeholder="Paste your Gemini API Key here"
+                        className="w-full pl-10 pr-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-800 transition-all"
+                    />
+                </div>
+                <button 
+                    type="submit"
+                    className="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-transform active:scale-95 shadow-lg shadow-indigo-200"
+                >
+                    Start Journey
+                </button>
+            </form>
+
+            <div className="text-xs text-slate-400 pt-4 border-t border-slate-100">
+                Don't have a key? {' '}
+                <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline font-semibold">
+                    Get one from Google AI Studio
                 </a>
             </div>
         </div>
@@ -166,10 +231,11 @@ const App: React.FC = () => {
         locationInfo={locationInfo}
         status={status}
         onGenerate={handleGenerate}
-        generatedImageUrl={generatedImageUrl}
+        generatedImages={generatedImages}
         onReset={handleReset}
         errorMessage={errorMessage}
-        onChangeKey={openKeySelection}
+        onChangeKey={clearApiKey}
+        onPoiSelect={handlePoiSelect}
       />
     </div>
   );

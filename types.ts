@@ -3,6 +3,12 @@ export interface Coordinates {
   lng: number;
 }
 
+export interface PointOfInterest {
+  name: string;
+  lat: number;
+  lng: number;
+}
+
 export interface LocationContext {
   name: string;
   description: string;
@@ -11,6 +17,8 @@ export interface LocationContext {
     condition: string; // e.g., "Sunny"
   };
   clothingRecommendation: string;
+  isVague?: boolean;
+  nearbyPOIs?: PointOfInterest[];
 }
 
 export enum TimeEra {
@@ -18,6 +26,9 @@ export enum TimeEra {
   PRESENT = 'Present Day',
   FUTURE = 'Future (Sci-Fi/Advanced)',
 }
+
+// Restricted styles as per request
+export type VisualStyle = 'Realistic' | 'Cinematic' | 'Documentary';
 
 export type AppStatus = 'idle' | 'analyzing_location' | 'ready_to_generate' | 'generating_image' | 'complete' | 'error';
 

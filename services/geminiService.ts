@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { LocationContext, TimeEra } from "../types";
 
 // Helper to convert Blob to Base64
@@ -19,26 +19,29 @@ export const blobToBase64 = (blob: Blob): Promise<string> => {
 const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * Analyzes the coordinates to provide context (Weather, Location Name, Description).
- * Uses gemini-2.5-flash with Google Maps Grounding for high accuracy.
+ * Analyzes the coordinates to provide context.
+ * Now accepts apiKey explicitly to support web deployment.
  */
-export const analyzeLocation = async (lat: number, lng: number): Promise<LocationContext> => {
-  if (!process.env.API_KEY) {
-    throw new Error("API Key not found");
-  }
+export const analyzeLocation = async (lat: number, lng: number, apiKey: string): Promise<LocationContext> => {
+  if (!apiKey) throw new Error("API Key is required");
 
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const ai = new GoogleGenAI({ apiKey });
   
-  // Prompt explicitly asks for Google Maps usage to ensure accuracy
   const prompt = `
     I am at coordinates: Latitude ${lat}, Longitude ${lng}.
     
-    Step 1: Use Google Maps to identify the exact location name (Specific Landmark, City, Region, Country).
-    Step 2: Create a JSON object with the following structure based on that location.
+    Task 1: Use Google Maps to identify the exact location.
+    Task 2: Determine if this location is "Specific" (a named landmark, city, building, park) or "Vague" (middle of the ocean, generic unnamed road, vast desert, generic field).
+    
+    Task 3: Create a JSON object with the following structure.
     
     Structure:
     {
       "name": "The specific location name found via Maps",
+      "isVague": boolean, // true if the location is generic/unclear, false if it is a specific place
+      "nearbyPOIs": [ // Only populate if isVague is true. Find up to 3 interesting landmarks/cities within 50km.
+         { "name": "Name of landmark", "lat": 0.00, "lng": 0.00 } 
+      ],
       "weather": {
         "temp": "Estimated typical temperature for right now (e.g. 25°C)",
         "condition": "Estimated typical condition (e.g. Sunny)"
@@ -55,7 +58,6 @@ export const analyzeLocation = async (lat: number, lng: number): Promise<Locatio
       model: "gemini-2.5-flash",
       contents: prompt,
       config: {
-        // use googleMaps tool for accuracy
         tools: [{ googleMaps: {} }], 
       }
     });
@@ -63,8 +65,6 @@ export const analyzeLocation = async (lat: number, lng: number): Promise<Locatio
     const text = response.text;
     if (!text) throw new Error("No response from AI");
 
-    // Clean up markdown formatting to extract JSON
-    // Matches ```json ... ``` or just { ... }
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     
     if (jsonMatch) {
@@ -75,22 +75,22 @@ export const analyzeLocation = async (lat: number, lng: number): Promise<Locatio
 
   } catch (error) {
     console.error("Error analyzing location:", error);
-    // Fallback for demo purposes if API fails or quota limited
     return {
       name: "Unknown Location",
-      description: "Could not retrieve exact location details. Please try again.",
+      description: "Could not retrieve exact location details.",
       weather: { temp: "--", condition: "Unknown" },
-      clothingRecommendation: "Casual wear"
+      clothingRecommendation: "Casual wear",
+      isVague: false
     };
   }
 };
 
 /**
  * Generates the travel photo.
- * Uses Nano Banana (gemini-2.5-flash-image) exclusively as requested.
- * This model is more efficient and has better availability than the Pro model.
+ * Supports B.C. years, apiKey injection, and shot variations.
  */
 export const generateTravelPhoto = async (
+  apiKey: string,
   lat: number,
   lng: number,
   locationName: string,
@@ -98,21 +98,42 @@ export const generateTravelPhoto = async (
   userImageBase64: string,
   weatherCondition: string,
   year?: string,
-  customPrompt?: string
+  customPrompt?: string,
+  style: string = 'Realistic',
+  variation: string = 'Standard Shot'
 ): Promise<string> => {
-    if (!process.env.API_KEY) {
-        throw new Error("API Key not found");
-    }
+    if (!apiKey) throw new Error("API Key is required");
   
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const ai = new GoogleGenAI({ apiKey });
 
-    // Construct detailed time description
+    // Handle Year logic for B.C. / A.D.
     let timeDescription = era as string;
+    let historicInstruction = "";
+
     if (year) {
-      timeDescription += ` (Specifically the year ${year})`;
+      // Check if it's B.C. (negative or formatted)
+      const yearNum = parseInt(year);
+      if (!isNaN(yearNum) && yearNum < 0) {
+          const absYear = Math.abs(yearNum);
+          timeDescription += ` (Specifically ${absYear} B.C.)`;
+          historicInstruction = `
+            CRITICAL HISTORICAL ACCURACY (B.C. ERA):
+            The year is ${absYear} B.C. (Before Christ/Common Era).
+            - MODERN CITIES DO NOT EXIST. Do NOT show modern buildings, roads, or ruins.
+            - Show the NATURAL LANDSCAPE (pristine forests, rivers, deserts, terrain) exactly as it would have looked at these coordinates (${lat}, ${lng}) in ${absYear} B.C.
+            - If early human settlements (Neolithic, Bronze Age, Indigenous tribes) were historically present in this specific region at that time, depict them accurately (huts, primitive tools, campfires).
+            - Clothing MUST be primitive and accurate to the region and era (e.g., animal skins, simple woven tunics).
+          `;
+      } else {
+          timeDescription += ` (Specifically the year ${year})`;
+          historicInstruction = `
+            HISTORICAL ACCURACY: The year is ${year}.
+            - Ensure architecture, street signs, technology, and background details match this year.
+            - If Future, use grounded sci-fi aesthetics suitable for ${year}.
+          `;
+      }
     }
 
-    // Construct a rich prompt for the image model
     const textPrompt = `
       Create a highly realistic and historically accurate travel photo.
 
@@ -120,29 +141,29 @@ export const generateTravelPhoto = async (
       - Location: ${locationName} (Lat: ${lat}, Lng: ${lng}).
       - Era/Year: ${timeDescription}.
       - Weather: ${weatherCondition}.
+      - Shot Variation: ${variation} (Ensure this image has a distinct composition).
 
-      USER INSTRUCTIONS (Integrate these strictly):
+      USER INSTRUCTIONS:
       "${customPrompt || "No specific scene instructions provided."}"
 
       REQUIREMENTS:
-      1. HISTORICAL ACCURACY: You must verify the historical context of ${locationName} in the year ${year || "of the era"}.
-         - If the year is past, ensure architecture, clothing, and background objects (cars, signs, technology) perfectly match that specific year.
-         - If the year is future, extrapolate based on the location's current geography but with advanced sci-fi aesthetics suitable for ${year}.
+      1. ${historicInstruction}
       
       2. SUBJECT: Insert the person from the reference image.
          - Maintain facial identity strictly.
-         - CHANGE CLOTHING: The subject MUST wear clothing that is historically/futuristically accurate for ${timeDescription} and suitable for ${weatherCondition} weather.
-         - Pose: Natural travel photo pose, interacting with the environment if described in User Instructions.
+         - CHANGE CLOTHING: The subject MUST wear clothing accurate to ${timeDescription} and ${weatherCondition}.
+         - Pose: Natural travel pose.
 
       3. AESTHETICS:
+         - Visual Style: ${style}. 
          - Photorealistic, 8k resolution, cinematic lighting.
-         - No text, no frames, no borders.
+         - No text, borders, or frames.
     `;
 
     const makeRequest = async (retryCount = 0): Promise<any> => {
         try {
             return await ai.models.generateContent({
-                model: 'gemini-2.5-flash-image', // Nano Banana
+                model: 'gemini-2.5-flash-image',
                 contents: {
                     parts: [
                         { text: textPrompt },
@@ -155,31 +176,18 @@ export const generateTravelPhoto = async (
                     ],
                 },
                 config: {
-                    imageConfig: {
-                        aspectRatio: "1:1",
-                    }
+                    imageConfig: { aspectRatio: "1:1" }
                 },
             });
         } catch (error: any) {
-            // Check for Rate Limit (429)
             if (error.message?.includes('429') || error.status === 429) {
-                // We will retry up to 2 times (total 3 attempts)
                 if (retryCount < 2) {
-                    console.log(`Quota exceeded. Retrying attempt ${retryCount + 1}...`);
-                    
-                    let delay = 3000 * Math.pow(2, retryCount); // Default backoff
-                    
-                    // Attempt to parse specific retry time from error message
+                    console.log(`Quota exceeded. Retrying...`);
+                    let delay = 3000 * Math.pow(2, retryCount);
                     const match = error.message?.match(/retry in ([0-9.]+)s/);
-                    if (match) {
-                        // Use the server's suggested delay + 2s buffer
-                        delay = Math.ceil(parseFloat(match[1])) * 1000 + 2000;
-                    }
-
-                    // If delay is under 70s, it's worth waiting automatically. 
-                    // Otherwise, user might think app crashed.
+                    if (match) delay = Math.ceil(parseFloat(match[1])) * 1000 + 2000;
+                    
                     if (delay < 70000) {
-                        console.log(`Waiting ${delay}ms before retry...`);
                         await wait(delay);
                         return makeRequest(retryCount + 1);
                     }
@@ -189,19 +197,11 @@ export const generateTravelPhoto = async (
         }
     };
 
-    try {
-        const response = await makeRequest();
-
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                return `data:image/png;base64,${part.inlineData.data}`;
-            }
+    const response = await makeRequest();
+    for (const part of response.candidates?.[0]?.content?.parts || []) {
+        if (part.inlineData) {
+            return `data:image/png;base64,${part.inlineData.data}`;
         }
-      
-        throw new Error("No image generated");
-
-    } catch (error) {
-      console.error("Error generating image:", error);
-      throw error;
     }
+    throw new Error("No image generated");
 };
